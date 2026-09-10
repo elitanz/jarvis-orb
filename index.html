@@ -504,6 +504,18 @@ let history=[], brainBusy=false;
 const brainEl=document.getElementById('brain');
 function storedKey(){try{return localStorage.getItem(KEY_STORE)||''}catch(_){return''}}
 function showBrain(){brainEl.textContent=storedKey()?'BRAIN GROQ':'BRAIN LOCAL';}
+
+// Key handoff via `#key=…`, so a QR code can carry it to a machine that can't
+// sign in. A fragment is never sent to the server, so the key never reaches
+// GitHub's logs — and it is wiped from the URL and history immediately.
+(function adoptKeyFromHash(){
+ const m=/[#&]key=([^&]+)/.exec(location.hash||'');
+ if(!m)return;
+ try{localStorage.setItem(KEY_STORE,decodeURIComponent(m[1]));}catch(_){}
+ // replaceState throws SecurityError on a file:// origin; scrub what we can.
+ try{history.replaceState(null,'',location.pathname+location.search);}
+ catch(_){location.hash='';}
+})();
 showBrain();
 
 async function askBrain(q){
