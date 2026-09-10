@@ -53,11 +53,12 @@
 <div class="hud" id="tl">J.A.R.V.I.S.<br><span id="up">UPTIME 00:00</span></div>
 <div class="hud" id="tr"><span id="mode">CORE ONLINE</span><br>
   INPUT<span id="lvl"><i></i></span></div>
-<div class="hud" id="bl">SYS <span id="fps">60</span> FPS</div>
+<div class="hud" id="bl">SYS <span id="fps">60</span> FPS<br>
+  <span id="pwr">PWR ——</span> · <span id="clk">--:--</span></div>
 <div id="cap"><span class="who"></span><br><span class="txt"></span></div>
-<div id="keys">F · fullscreen<br>M · mute mic</div>
+<div id="keys">say &ldquo;jarvis&hellip;&rdquo; to talk<br>F · fullscreen &nbsp; M · mute mic</div>
 <div id="gate"><b>Tap to engage</b>
-  <small>Allow the microphone and the reactor answers your voice<br>
+  <small>Allow the microphone, then say &ldquo;Jarvis, what time is it?&rdquo;<br>
   Decline and it runs its own demo cycle</small></div>
 <script type="module">
 import * as THREE from 'three';
@@ -355,7 +356,9 @@ function frame(t){requestAnimationFrame(frame);
   fpsN=0;fpsT=s;}
  if(((s*2)|0)!==upTick){upTick=(s*2)|0;
   const e=(t-frame.t0)/1000|0;
-  up.textContent=`UPTIME ${String((e/60)|0).padStart(2,'0')}:${String(e%60).padStart(2,'0')}`;}
+  up.textContent=`UPTIME ${String((e/60)|0).padStart(2,'0')}:${String(e%60).padStart(2,'0')}`;
+  const d=new Date();
+  clkEl.textContent=`${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;}
  composer.render();}
 requestAnimationFrame(frame);
 
@@ -385,12 +388,16 @@ const THINK_MS=1400, SPEAK_MS=2800;
 const DEMO_CYCLE_MS=9000, DEMO_TALK_MS=3200;
 const TICK_MS=50;
 
+const SPEAK_MAX_MS=14000;      // watchdog: never get stuck mid-utterance
+const WAKE=/\bjarvis\b/i;
+
 const LINES=['At your service.','All systems nominal.',
  'Reactor holding at full capacity.','Diagnostics complete.',
  'Running on local power.','Standing by.'];
 
 let analyser=null, timeData=null, micOn=false;
 let phase='idle', phaseAt=0, loudSince=0, quietSince=0, lineIdx=0;
+let pendingQuery=null, awaitingReply=false, speakWatchdog=0;
 
 function micLevel(){
  if(!analyser)return 0;
@@ -410,6 +417,115 @@ function speakEnvelope(now){
 }
 function enter(p,now){phase=p;phaseAt=now;setState(p);}
 
+/* --------------------------- battery / clock -------------------------- */
+// Real telemetry in the HUD beats invented numbers, and it answers a question.
+let battPct=null, battCharging=false;
+const pwrEl=document.getElementById('pwr'), clkEl=document.getElementById('clk');
+if(navigator.getBattery)navigator.getBattery().then(b=>{
+ const upd=()=>{battPct=Math.round(b.level*100);battCharging=b.charging;
+  pwrEl.textContent=`PWR ${battPct}%${b.charging?' +':''}`;};
+ upd();b.addEventListener('levelchange',upd);b.addEventListener('chargingchange',upd);
+}).catch(()=>{});
+
+/* ------------------------------ answers ------------------------------- */
+// Deliberately a local pattern matcher, not an AI. The fallback line says so
+// rather than bluffing — this page has no brain and shouldn't pretend to.
+function twoDigit(n){return String(n).padStart(2,'0');}
+function answer(q){
+ const t=q.toLowerCase();
+ if(/\b(time|clock)\b/.test(t)){const d=new Date();
+  return `It is ${d.getHours()%12||12}:${twoDigit(d.getMinutes())} ${d.getHours()<12?'A M':'P M'}.`;}
+ if(/\b(date|day|today)\b/.test(t))
+  return `Today is ${new Date().toLocaleDateString(undefined,
+   {weekday:'long',month:'long',day:'numeric'})}.`;
+ if(/\b(battery|power|charge|charged)\b/.test(t))
+  return battPct==null?'No battery reading is available on this machine.'
+   :`Battery at ${battPct} percent${battCharging?', and charging':''}.`;
+ if(/\b(hello|hi|hey|good morning|good afternoon|good evening)\b/.test(t))
+  return 'Good to see you, sir.';
+ if(/(who are you|your name|what are you)/.test(t))
+  return 'I am the reactor interface, running locally in your browser.';
+ if(/\b(status|systems|diagnostics?|report)\b/.test(t))
+  return `All systems nominal. Rendering at ${fpsEl.textContent} frames per second.`;
+ if(/(full ?screen|maximi[sz]e)/.test(t)){
+  document.documentElement.requestFullscreen().catch(()=>{});return 'Expanding.';}
+ if(/\b(thank you|thanks|cheers)\b/.test(t))return 'Always a pleasure.';
+ if(/(shut ?down|power down|goodbye|good bye)/.test(t))
+  return 'Standing down. Say my name when you need me.';
+ return 'I only run the reactor on this machine, sir. '
+      + 'The thinking half of me lives on the Mac.';
+}
+
+/* --------------------------- speech synthesis ------------------------- */
+let ttsVoice=null;
+function pickVoice(){
+ const vs=speechSynthesis.getVoices();
+ ttsVoice=vs.find(v=>/en-GB/i.test(v.lang)&&/male|daniel|arthur|george|oliver/i.test(v.name))
+        ||vs.find(v=>/en-GB/i.test(v.lang))
+        ||vs.find(v=>/^en/i.test(v.lang))||null;
+}
+if('speechSynthesis' in window){pickVoice();speechSynthesis.onvoiceschanged=pickVoice;}
+function speak(text,onDone){
+ if(!('speechSynthesis' in window)){setTimeout(onDone,SPEAK_MS);return;}
+ const u=new SpeechSynthesisUtterance(text);
+ if(ttsVoice)u.voice=ttsVoice;
+ u.rate=.98; u.pitch=.8;
+ u.onend=onDone; u.onerror=onDone;
+ speechSynthesis.speak(u);
+}
+
+/* -------------------------- speech recognition ------------------------ */
+const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+let recog=null, recogAllowed=false, recogWanted=false;
+function heard(text){
+ caption('You',text.slice(-160));
+ if(WAKE.test(text))pendingQuery=text.replace(WAKE,' ').trim();
+}
+function startRecog(){
+ if(!SR)return;
+ recog=new SR();
+ recog.continuous=true; recog.interimResults=true; recog.lang='en-US';
+ recog.onresult=e=>{
+  let fin='',interim='';
+  for(let i=e.resultIndex;i<e.results.length;i++){
+   const r=e.results[i];
+   if(r.isFinal)fin+=r[0].transcript; else interim+=r[0].transcript;
+  }
+  if(interim.trim())caption('You',interim.trim().slice(-160));
+  if(fin.trim())heard(fin.trim());
+ };
+ // Chrome ends the session on its own schedule; restart unless we paused it.
+ recog.onend=()=>{if(recogWanted&&recogAllowed)try{recog.start()}catch(_){}};
+ recog.onerror=ev=>{
+  if(ev.error==='not-allowed'||ev.error==='service-not-allowed')recogAllowed=false;
+ };
+ recogAllowed=true; recogWanted=true;
+ try{recog.start()}catch(_){recogAllowed=false;}
+}
+// Muted while JARVIS talks, or it transcribes its own voice back to itself.
+function pauseRecog(){recogWanted=false;if(recog)try{recog.stop()}catch(_){}}
+function resumeRecog(){
+ if(!recog||!recogAllowed)return;
+ recogWanted=true; try{recog.start()}catch(_){}
+}
+
+function finishSpeaking(){
+ clearTimeout(speakWatchdog);
+ resumeRecog(); awaitingReply=false; enter('idle',performance.now());
+}
+function beginReply(now){
+ const q=pendingQuery; pendingQuery=null; awaitingReply=true;
+ enter('thinking',now);
+ setTimeout(()=>{
+  const text=answer(q);
+  caption('J.A.R.V.I.S.',text);
+  enter('speaking',performance.now());
+  pauseRecog();
+  speak(text,finishSpeaking);
+  speakWatchdog=setTimeout(()=>{if(phase==='speaking')finishSpeaking();},SPEAK_MAX_MS);
+ },THINK_MS);
+}
+
 function tick(){
  const now=performance.now();
  const lv=micOn?micLevel():demoLevel(now);
@@ -419,6 +535,10 @@ function tick(){
  if(phase==='speaking'){mic=0;voice=speakEnvelope(now);}
  else{voice=0;mic=lv;}
 
+ // A real question outranks the volume machine: answer it, then resume.
+ if(awaitingReply)return;
+ if(pendingQuery){beginReply(now);return;}
+
  if(phase==='idle'){
   if(loudSince)enter('listening',now);
  }else if(phase==='listening'){
@@ -427,8 +547,11 @@ function tick(){
  }else if(phase==='recording'){
   if(quietSince&&now-quietSince>SILENCE_MS)enter('thinking',now);
  }else if(phase==='thinking'){
-  if(now-phaseAt>THINK_MS){enter('speaking',now);
-   caption('J.A.R.V.I.S.',LINES[lineIdx++%LINES.length]);}
+  if(now-phaseAt>THINK_MS){
+   // Listening for real words: no wake word means nothing to answer.
+   if(recogAllowed)enter('idle',now);
+   else{enter('speaking',now);caption('J.A.R.V.I.S.',LINES[lineIdx++%LINES.length]);}
+  }
  }else if(phase==='speaking'){
   if(now-phaseAt>SPEAK_MS)enter('idle',now);
  }
@@ -447,6 +570,7 @@ async function engage(){
   ac.createMediaStreamSource(stream).connect(analyser);
   timeData=new Uint8Array(analyser.frequencyBinCount);
   micOn=true;
+  startRecog();                    // words, on top of the volume animation
  }catch(err){
   micOn=false;                     // denied, blocked, or no mic: demo cycle
   mode.textContent='DEMO CYCLE';
@@ -464,6 +588,7 @@ addEventListener('keydown',e=>{
  if(k==='f'){document.fullscreenElement?document.exitFullscreen()
   :document.documentElement.requestFullscreen().catch(()=>{});}
  else if(k==='m'&&analyser){micOn=!micOn;
+  micOn?resumeRecog():pauseRecog();
   mode.textContent=micOn?MODES[phase]:'DEMO CYCLE';}
  else if(k==='enter'&&!gate.classList.contains('gone'))engage();
 });
@@ -477,7 +602,9 @@ addEventListener('mousemove',()=>{
 });
 
 window.__jarvis={setState,setMic:v=>mic=v,setVoice:v=>voice=v,caption,
- engage,get phase(){return phase},get micOn(){return micOn}};
+ engage,answer,heard,speak,
+ get phase(){return phase},get micOn(){return micOn},
+ get recogAllowed(){return recogAllowed}};
 window.__dbg={renderer,scene,cam,composer,hue,targetHue,
  get boot(){return boot},setLevels(m,v){mic=m;voice=v;}};
 </script>
