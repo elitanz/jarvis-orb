@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>J.A.R.V.I.S. — Arc Reactor</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="A live arc-reactor interface that reacts to your voice. Runs entirely in the browser.">
+<meta name="theme-color" content="#0a0501">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='none' stroke='%23ff9a3c' stroke-width='2'/%3E%3Ccircle cx='16' cy='16' r='5' fill='%23ffd166'/%3E%3C/svg%3E">
+<style>
+  html,body{margin:0;height:100%;background:#0a0501;overflow:hidden;
+    font-family:"SF Mono","Menlo",monospace}
+  body.hidecursor{cursor:none}
+  .hud{position:fixed;color:#9e7a3f;font-size:10px;letter-spacing:.22em;
+    text-transform:uppercase;pointer-events:none;
+    text-shadow:0 0 10px rgba(255,170,70,.4)}
+  #tl{top:3vh;left:3vw;line-height:2}
+  #tr{top:3vh;right:3vw;text-align:right;line-height:2}
+  #bl{bottom:3vh;left:3vw;line-height:2}
+  #st{position:fixed;top:4vh;left:50%;transform:translateX(-50%);
+    font-weight:600;font-size:12px;letter-spacing:.7em;text-transform:uppercase;
+    color:#7d5a2e;transition:color .4s;text-shadow:0 0 14px currentColor;
+    pointer-events:none}
+  #lvl{display:inline-block;width:80px;height:2px;background:#331e0a;margin-left:8px;
+    vertical-align:middle;overflow:hidden}
+  #lvl i{display:block;height:100%;width:0%;background:currentColor;transition:width .1s}
+  #cap{position:fixed;left:50%;bottom:7vh;transform:translateX(-50%);max-width:66vw;
+    font-size:clamp(13px,1.4vw,17px);line-height:1.6;color:#ffd9a0;text-align:center;
+    text-shadow:0 0 18px rgba(255,180,80,.5);opacity:0;transition:opacity .5s}
+  #cap .who{color:#8f6a41;font-size:.7em;letter-spacing:.32em;text-transform:uppercase}
+  /* Start gate: browsers only grant mic + audio after a real user gesture. */
+  #gate{position:fixed;inset:0;display:flex;flex-direction:column;gap:18px;
+    align-items:center;justify-content:center;background:rgba(10,5,1,.72);
+    backdrop-filter:blur(3px);z-index:9;cursor:pointer;transition:opacity .6s;
+    text-align:center;padding:0 6vw}
+  #gate.gone{opacity:0;pointer-events:none}
+  #gate b{color:#ffd9a0;font-size:clamp(15px,2vw,22px);font-weight:600;
+    letter-spacing:.42em;text-transform:uppercase;
+    text-shadow:0 0 22px rgba(255,180,80,.55)}
+  #gate small{color:#9e7a3f;font-size:11px;letter-spacing:.2em;line-height:2.1;
+    text-transform:uppercase}
+  #keys{position:fixed;bottom:3vh;right:3vw;color:#6d4e26;font-size:9px;
+    letter-spacing:.2em;text-transform:uppercase;line-height:2;text-align:right;
+    pointer-events:none;transition:opacity .5s}
+</style>
+<script type="importmap">
+{"imports":{"three":"https://unpkg.com/three@0.160.0/build/three.module.js",
+"three/addons/":"https://unpkg.com/three@0.160.0/examples/jsm/"}}
+</script>
+</head>
+<body>
+<div id="st">BOOT</div>
+<div class="hud" id="tl">J.A.R.V.I.S.<br><span id="up">UPTIME 00:00</span></div>
+<div class="hud" id="tr"><span id="mode">CORE ONLINE</span><br>
+  INPUT<span id="lvl"><i></i></span></div>
+<div class="hud" id="bl">SYS <span id="fps">60</span> FPS</div>
+<div id="cap"><span class="who"></span><br><span class="txt"></span></div>
+<div id="keys">F · fullscreen<br>M · mute mic</div>
+<div id="gate"><b>Tap to engage</b>
+  <small>Allow the microphone and the reactor answers your voice<br>
+  Decline and it runs its own demo cycle</small></div>
+<script type="module">
+import * as THREE from 'three';
+import {EffectComposer} from 'three/addons/postprocessing/EffectComposer.js';
+import {RenderPass} from 'three/addons/postprocessing/RenderPass.js';
+import {UnrealBloomPass} from 'three/addons/postprocessing/UnrealBloomPass.js';
+import {ShaderPass} from 'three/addons/postprocessing/ShaderPass.js';
+
+/* ============================== state ================================= */
+// Orange reactor. Each state still has to be tellable apart at a glance, so
+// recording goes red (the record-light convention) and thinking goes gold.
+const COLORS={idle:0xff9a3c,listening:0xffb765,recording:0xff5f3c,
+              thinking:0xffd166,speaking:0xffc078};
+let state='idle', mic=0, voice=0, boot=0;
+const hue=new THREE.Color(COLORS.idle), targetHue=new THREE.Color(COLORS.idle);
+
+/* ============================ renderer ================================ */
+const renderer=new THREE.WebGLRenderer({antialias:true,powerPreference:'high-performance'});
+renderer.setPixelRatio(Math.min(devicePixelRatio,1.5));
+renderer.setSize(innerWidth,innerHeight);
+document.body.prepend(renderer.domElement);
+renderer.domElement.addEventListener('webglcontextlost',()=>location.reload());
+const scene=new THREE.Scene();
+const cam=new THREE.PerspectiveCamera(42,innerWidth/innerHeight,.1,100);
+// Camera distance = how big the reactor reads. Embedded in the dashboard the
+// panel is much smaller than a fullscreen window, so dolly back to give the
+// orb breathing room inside its frame.
+const EMBED=new URLSearchParams(location.search).has('embed');
+const CAM_R=EMBED?12.4:9;
+cam.position.set(0,.4,CAM_R);
+
+/* ================= material factory (all crisp additive) ============== */
+const mats=[];
+function lineMat(base){const m=new THREE.LineBasicMaterial({color:0xffffff,
+ transparent:true,opacity:0,blending:THREE.AdditiveBlending,depthWrite:false});
+ mats.push({m,base});return m;}
+function meshMat(base){const m=new THREE.MeshBasicMaterial({color:0xffffff,
+ transparent:true,opacity:0,blending:THREE.AdditiveBlending,depthWrite:false,
+ side:THREE.DoubleSide});mats.push({m,base});return m;}
+
+/* ====================== builders ====================================== */
+function circleLine(parent,r,op,seg=128){const pts=[];
+ for(let i=0;i<=seg;i++){const a=(i/seg)*6.2832;
+  pts.push(new THREE.Vector3(Math.cos(a)*r,Math.sin(a)*r,0));}
+ const l=new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts),lineMat(op));
+ parent.add(l);return l;}
+function dashes(parent,r,n,frac,op){const g=new THREE.Group();
+ for(let i=0;i<n;i++){const a0=(i/n)*6.2832,a1=a0+(6.2832/n)*frac,pts=[];
+  for(let k=0;k<=6;k++){const a=a0+(a1-a0)*k/6;
+   pts.push(new THREE.Vector3(Math.cos(a)*r,Math.sin(a)*r,0));}
+  g.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts),lineMat(op)));}
+ parent.add(g);return g;}
+function ticks(parent,r0,r1,n,op,every=15,extra=.08){const pos=[];
+ for(let i=0;i<n;i++){const a=(i/n)*6.2832,c=Math.cos(a),s=Math.sin(a),
+  R=r1+(i%every===0?extra:0);
+  pos.push(c*r0,s*r0,0,c*R,s*R,0);}
+ const g=new THREE.BufferGeometry();
+ g.setAttribute('position',new THREE.BufferAttribute(new Float32Array(pos),3));
+ const l=new THREE.LineSegments(g,lineMat(op));parent.add(l);return l;}
+
+/* ============ CORE: wireframe reactor heart (true 3D) ================= */
+const coreGrp=new THREE.Group(); scene.add(coreGrp);
+const coreWire=new THREE.Mesh(new THREE.IcosahedronGeometry(.52,1),
+ new THREE.MeshBasicMaterial({color:0xffffff,wireframe:true,transparent:true,
+  opacity:0,blending:THREE.AdditiveBlending,depthWrite:false}));
+mats.push({m:coreWire.material,base:.85}); coreGrp.add(coreWire);
+const coreInner=new THREE.Mesh(new THREE.IcosahedronGeometry(.34,1),
+ new THREE.MeshBasicMaterial({color:0xffffff,wireframe:true,transparent:true,
+  opacity:0,blending:THREE.AdditiveBlending,depthWrite:false}));
+mats.push({m:coreInner.material,base:.6}); coreGrp.add(coreInner);
+/* glow sprite behind the heart */
+const glowU={uC:{value:hue},uB:{value:0},uHot:{value:.6}};
+const glow=new THREE.Mesh(new THREE.PlaneGeometry(3,3),
+ new THREE.ShaderMaterial({uniforms:glowU,transparent:true,depthWrite:false,
+  blending:THREE.AdditiveBlending,
+ vertexShader:`varying vec2 vU;void main(){vU=uv*2.-1.;
+  gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.);}`,
+ fragmentShader:`uniform vec3 uC;uniform float uB,uHot;varying vec2 vU;
+ void main(){float d=length(vU);
+  float g=pow(max(0.,1.-d),2.4)*uHot;
+  vec3 col=mix(uC,vec3(1.),.55)*g;
+  gl_FragColor=vec4(col*uB,g*uB);}`}));
+scene.add(glow);
+/* tight white-hot center — the intense core burst */
+const hotU={uC:{value:hue},uB:{value:0},uHot:{value:0}};
+const hotcore=new THREE.Mesh(new THREE.PlaneGeometry(1.7,1.7),
+ new THREE.ShaderMaterial({uniforms:hotU,transparent:true,depthWrite:false,
+  blending:THREE.AdditiveBlending,
+ vertexShader:`varying vec2 vU;void main(){vU=uv*2.-1.;
+  gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.);}`,
+ fragmentShader:`uniform vec3 uC;uniform float uB,uHot;varying vec2 vU;
+ void main(){float d=length(vU);
+  float g=pow(max(0.,1.-d),4.5);
+  vec3 col=mix(uC,vec3(1.),.85)*g*uHot;
+  gl_FragColor=vec4(col*uB,g*uB*.9);}`}));
+scene.add(hotcore);
+
+/* ======== DIAL A: reactor instruments (near-flat, slight tilt) ======== */
+const dialA=new THREE.Group(); dialA.rotation.x=-.14; scene.add(dialA);
+const coils=new THREE.Group();
+for(let i=0;i<10;i++){const a=(i/10)*6.2832;
+ const p=new THREE.Mesh(new THREE.PlaneGeometry(.3,.16),meshMat(.7));
+ p.position.set(Math.cos(a)*.92,Math.sin(a)*.92,0);
+ p.rotation.z=a+Math.PI/2; coils.add(p);}
+dialA.add(coils);
+circleLine(dialA,1.06,.4);
+const triRing=new THREE.Group();
+for(let i=0;i<12;i++){const a=(i/12)*6.2832;
+ const t=new THREE.Mesh(new THREE.CircleGeometry(.05,3),meshMat(.5));
+ t.position.set(Math.cos(a)*1.2,Math.sin(a)*1.2,0);
+ t.rotation.z=a-Math.PI/2; triRing.add(t);}
+dialA.add(triRing);
+const dash1=dashes(dialA,1.38,48,.55,.5);
+const dashHot=dashes(dialA,1.24,80,.42,.42);
+circleLine(dialA,1.72,.28);
+const tickRing=ticks(dialA,1.55,1.66,96,.45);
+/* level arc — input level wraps the dial */
+const lvlArc=new THREE.Mesh(new THREE.RingGeometry(1.46,1.5,64,1,0,.01),meshMat(.9));
+dialA.add(lvlArc);
+/* radar sweep (thinking) */
+const sweep=new THREE.Mesh(new THREE.CircleGeometry(1.66,48,0,.5),
+ new THREE.ShaderMaterial({transparent:true,depthWrite:false,
+  blending:THREE.AdditiveBlending,uniforms:{uC:{value:hue},uO:{value:0}},
+  vertexShader:`varying vec2 vU;void main(){vU=uv;
+   gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.);}`,
+  fragmentShader:`uniform vec3 uC;uniform float uO;varying vec2 vU;
+  void main(){float a=atan(vU.y-.5,vU.x-.5);
+   gl_FragColor=vec4(uC,uO*smoothstep(-.6,.5,a)*.45);}`}));
+dialA.add(sweep);
+
+/* ========= DIAL B: mid instruments, tilted the OTHER way (3D) ========= */
+const dialB=new THREE.Group(); dialB.rotation.x=.42; dialB.position.z=-.3;
+scene.add(dialB);
+const dash2=dashes(dialB,1.98,24,.4,.42);
+const arcsB=dashes(dialB,2.2,3,.55,.6);
+circleLine(dialB,2.34,.25);
+
+/* ========= DIAL C: outer instruments, tilted more (deep 3D) =========== */
+const dialC=new THREE.Group(); dialC.rotation.x=-.55; dialC.position.z=-.7;
+scene.add(dialC);
+const dash3=dashes(dialC,2.62,64,.3,.3);
+const tickC=ticks(dialC,2.72,2.8,180,.22,45,.07);
+circleLine(dialC,2.9,.22);
+
+/* ============ heavy gyroscope hoops precessing (strong 3D) ============ */
+function hoop(r,tube,op){const m=new THREE.Mesh(
+ new THREE.TorusGeometry(r,tube,6,160),meshMat(op));scene.add(m);return m;}
+const gy1=hoop(2.5,.008,.5), gy2=hoop(2.75,.005,.4);
+gy1.rotation.set(1.25,.3,0); gy2.rotation.set(.7,-.4,0);
+
+/* ============ orbital particle rings (inclined, 3 planes) ============= */
+const orbitals=[];
+for(const[inc,r,n,sp]of[[.45,3.1,42,.35],[-.7,3.35,54,-.22],[1.1,2.95,36,.5]]){
+ const g=new THREE.Group();g.rotation.x=inc;
+ const geo=new THREE.BufferGeometry(),pos=new Float32Array(n*3);
+ for(let i=0;i<n;i++){const a=(i/n)*6.2832;
+  pos[i*3]=Math.cos(a)*r;pos[i*3+1]=0;pos[i*3+2]=Math.sin(a)*r;}
+ geo.setAttribute('position',new THREE.BufferAttribute(pos,3));
+ const m=new THREE.PointsMaterial({color:0xffffff,size:.045,transparent:true,
+  opacity:0,blending:THREE.AdditiveBlending,depthWrite:false});
+ mats.push({m,base:.7});
+ g.add(new THREE.Points(geo,m)); scene.add(g); orbitals.push({g,sp});}
+
+/* =============== hologram globe (present, breathing) ================== */
+const globe=new THREE.Group();
+for(let i=1;i<8;i++){const ph=(i/8)*Math.PI,r=Math.sin(ph)*3.6,y=Math.cos(ph)*3.6,
+ pts=[];for(let k=0;k<=90;k++){const a=(k/90)*6.2832;
+  pts.push(new THREE.Vector3(Math.cos(a)*r,y,Math.sin(a)*r));}
+ globe.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts),lineMat(.10)));}
+for(let i=0;i<10;i++){const a0=(i/10)*Math.PI,pts=[];
+ for(let k=0;k<=90;k++){const ph=(k/90)*Math.PI;
+  pts.push(new THREE.Vector3(Math.sin(ph)*Math.cos(a0)*3.6,Math.cos(ph)*3.6,
+           Math.sin(ph)*Math.sin(a0)*3.6));}
+ globe.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts),lineMat(.10)));}
+scene.add(globe);
+
+/* ============== floating data panes (workshop holograms) ============== */
+const panes=new THREE.Group(); scene.add(panes);
+for(const[x,y,z,ry]of[[-3.4,1.5,-1,.55],[3.4,1.2,-1,-.55],
+                      [-3.1,-1.6,-.6,.4],[3.2,-1.7,-.6,-.4]]){
+ const p=new THREE.Group();
+ const w=1.15,h=.72;
+ const frame=[new THREE.Vector3(-w/2,-h/2,0),new THREE.Vector3(w/2,-h/2,0),
+  new THREE.Vector3(w/2,h/2,0),new THREE.Vector3(-w/2,h/2,0),
+  new THREE.Vector3(-w/2,-h/2,0)];
+ p.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(frame),lineMat(.4)));
+ for(let i=0;i<4;i++){const yy=h/2-.16-i*.14,len=.25+((i*37)%53)/100;
+  p.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(
+   [new THREE.Vector3(-w/2+.1,yy,0),new THREE.Vector3(-w/2+.1+len,yy,0)]),
+   lineMat(.35)));}
+ p.position.set(x,y,z); p.rotation.y=ry; panes.add(p);}
+
+/* --- sparse dust --- */
+{const n=350,g=new THREE.BufferGeometry(),p=new Float32Array(n*3);
+ for(let i=0;i<n*3;i++)p[i]=(Math.random()-.5)*24;
+ g.setAttribute('position',new THREE.BufferAttribute(p,3));
+ const m=new THREE.PointsMaterial({color:0xb8702b,size:.035,transparent:true,
+  opacity:0,blending:THREE.AdditiveBlending,depthWrite:false});
+ mats.push({m,base:.5}); scene.add(new THREE.Points(g,m));}
+
+/* ============================ post fx ================================= */
+const composer=new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene,cam));
+const bloom=new UnrealBloomPass(new THREE.Vector2(innerWidth,innerHeight),.92,.55,.14);
+composer.addPass(bloom);
+const finalPass=new ShaderPass({
+ uniforms:{tDiffuse:{value:null},uT:{value:0}},
+ vertexShader:`varying vec2 vUv;void main(){vUv=uv;
+  gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.);}`,
+ fragmentShader:`uniform sampler2D tDiffuse;uniform float uT;varying vec2 vUv;
+ float rnd(vec2 p){return fract(sin(dot(p,vec2(12.9898,78.233)))*43758.5453);}
+ void main(){vec2 d=(vUv-.5)*.0022;
+  vec3 c=vec3(texture2D(tDiffuse,vUv+d).r,texture2D(tDiffuse,vUv).g,
+              texture2D(tDiffuse,vUv-d).b);
+  c*=.96+.04*sin(vUv.y*900.);
+  c+=(rnd(vUv*vec2(1920.,1080.)+uT*60.)-.5)*.05;
+  c*=1.-smoothstep(.72,1.4,length(vUv-.5))*.35;
+  gl_FragColor=vec4(c,1.);}`});
+composer.addPass(finalPass);
+addEventListener('resize',()=>{cam.aspect=innerWidth/innerHeight;
+ cam.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight);
+ composer.setSize(innerWidth,innerHeight);});
+
+/* ========================== render loop =============================== */
+// Chromebook safety valve: if the bloom pass is too much for the GPU, drop to
+// 1x pixel ratio once rather than limping along at 25 fps.
+const FPS_FLOOR=40, PERF_GRACE_S=4;
+let spin=1,hot=.6,sweepO=0,lvlShown=0,fpsN=0,fpsT=0,upTick=-1;
+const lvlEl=document.querySelector('#lvl i'),up=document.getElementById('up'),
+      fpsEl=document.getElementById('fps');
+function frame(t){requestAnimationFrame(frame);
+ if(window.__freeze){composer.render();return}
+ const s=t*.001; finalPass.uniforms.uT.value=s;
+ if(!frame.t0)frame.t0=t;
+ boot=Math.min(1,(t-frame.t0)/2000); const bE=boot*boot*(3-2*boot);
+
+ let tSpin=1,tHot=.6,tSweep=0;
+ const lv=Math.max(mic,voice);
+ if(state==='listening'){tSpin=1.6;tHot=.75+mic*.6;}
+ else if(state==='recording'){tSpin=2.2;tHot=.85+mic*.8;}
+ else if(state==='thinking'){tSpin=5.5;tHot=1.1;tSweep=1;}
+ else if(state==='speaking'){tSpin=2.6;tHot=.8+voice*1.1;}
+ spin+=(tSpin-spin)*.05; hot+=(tHot-hot)*.1; sweepO+=(tSweep-sweepO)*.07;
+ lvlShown+=(lv-lvlShown)*.25;
+
+ hue.lerp(targetHue,.08);
+ glowU.uC.value=hue; glowU.uB.value=bE; glowU.uHot.value=hot*.72;
+ hotU.uC.value=hue; hotU.uB.value=bE; hotU.uHot.value=hot*1.35;
+ hotcore.quaternion.copy(cam.quaternion);
+ for(const{m,base}of mats){m.color.copy(hue);m.opacity=base*bE;}
+
+ // core heart: counter-rotating shells + pulse
+ coreWire.rotation.y=s*.5; coreWire.rotation.x=s*.23;
+ coreInner.rotation.y=-s*.8; coreInner.rotation.z=s*.4;
+ const beat=1+Math.sin(s*2.1)*.03+lv*.12;
+ coreGrp.scale.setScalar(beat*bE);
+ glow.quaternion.copy(cam.quaternion);      // glow always faces camera
+
+ // dials: differential rotation + slow 3D wobble
+ dash1.rotation.z=s*.12*spin; tickRing.rotation.z=s*.02*spin;
+ dashHot.rotation.z=-s*.09*spin;
+ triRing.rotation.z=-s*.06*spin; coils.rotation.z=s*.04*spin;
+ dialA.rotation.x=-.14+Math.sin(s*.21)*.05;
+ dash2.rotation.z=-s*.1*spin; arcsB.rotation.z=s*.32*spin;
+ dialB.rotation.x=.42+Math.sin(s*.17)*.08; dialB.rotation.y=Math.sin(s*.13)*.1;
+ dash3.rotation.z=-s*.05*spin; tickC.rotation.z=s*.018*spin;
+ dialC.rotation.x=-.55+Math.sin(s*.11)*.1; dialC.rotation.y=-Math.sin(s*.09)*.12;
+
+ // gyros precess (the strongest 3D cue)
+ gy1.rotation.z=s*.5*spin; gy1.rotation.x=1.25+Math.sin(s*.33)*.35;
+ gy2.rotation.z=-s*.4*spin; gy2.rotation.y=-.4+Math.sin(s*.27)*.45;
+
+ // orbital particle rings
+ for(const{g,sp}of orbitals)g.rotation.y=s*sp*spin;
+
+ globe.rotation.y=s*.07; globe.rotation.x=Math.sin(s*.05)*.22;
+ panes.rotation.y=Math.sin(s*.06)*.05;
+ sweep.rotation.z=-s*2.4; sweep.material.uniforms.uO.value=sweepO*bE;
+ sweep.material.uniforms.uC.value=hue;
+
+ // level arc sweeps around the dial
+ const span=Math.max(.01,lvlShown*5.8);
+ lvlArc.geometry.dispose();
+ lvlArc.geometry=new THREE.RingGeometry(1.46,1.5,64,1,Math.PI/2-span/2,span);
+
+ // camera: slow orbit — sells the depth
+ const ca=Math.sin(s*.08)*.55;
+ cam.position.set(Math.sin(ca)*CAM_R,.4+Math.sin(s*.06)*.5,Math.cos(ca)*CAM_R);
+ cam.lookAt(0,0,0);
+
+ lvlEl.style.width=(lv*100).toFixed(0)+'%';
+ fpsN++; if(s-fpsT>1){fpsEl.textContent=fpsN;
+  if(s>PERF_GRACE_S&&fpsN<FPS_FLOOR&&renderer.getPixelRatio()>1){
+   renderer.setPixelRatio(1);composer.setSize(innerWidth,innerHeight);}
+  fpsN=0;fpsT=s;}
+ if(((s*2)|0)!==upTick){upTick=(s*2)|0;
+  const e=(t-frame.t0)/1000|0;
+  up.textContent=`UPTIME ${String((e/60)|0).padStart(2,'0')}:${String(e%60).padStart(2,'0')}`;}
+ composer.render();}
+requestAnimationFrame(frame);
+
+/* ========================== live events =============================== */
+const st=document.getElementById('st'),cap=document.getElementById('cap'),
+      mode=document.getElementById('mode');
+const MODES={idle:'CORE ONLINE',listening:'AUDIO INTAKE',recording:'CAPTURING',
+             thinking:'PROCESSING',speaking:'RESPONDING'};
+function setState(s){state=s;targetHue.set(COLORS[s]??COLORS.idle);
+ st.textContent=s.toUpperCase();st.style.color='#'+targetHue.getHexString();
+ mode.textContent=MODES[s]??s.toUpperCase();}
+function caption(who,txt){cap.querySelector('.who').textContent=who;
+ cap.querySelector('.txt').textContent=txt;cap.style.opacity=1;
+ clearTimeout(cap._t);cap._t=setTimeout(()=>cap.style.opacity=0,9000);}
+/* ====================== standalone voice driver =======================
+   The original orb took its state from the JARVIS server over a WebSocket.
+   This build has no server: the browser's own microphone drives the same
+   state machine, so the reactor wakes when you speak. If the mic is denied
+   or blocked by policy, a synthetic level feeds the identical machine and
+   it runs a demo cycle instead — one code path, two sources.            */
+const MIC_GAIN=7;              // speech RMS is tiny; scale it into 0..1
+const SPEECH_ON=.11;           // level that counts as "someone is talking"
+const SPEECH_OFF=.06;          // hysteresis, so it doesn't chatter
+const SUSTAIN_MS=240;          // loud this long => actually recording
+const SILENCE_MS=700;          // quiet this long => done talking
+const THINK_MS=1400, SPEAK_MS=2800;
+const DEMO_CYCLE_MS=9000, DEMO_TALK_MS=3200;
+const TICK_MS=50;
+
+const LINES=['At your service.','All systems nominal.',
+ 'Reactor holding at full capacity.','Diagnostics complete.',
+ 'Running on local power.','Standing by.'];
+
+let analyser=null, timeData=null, micOn=false;
+let phase='idle', phaseAt=0, loudSince=0, quietSince=0, lineIdx=0;
+
+function micLevel(){
+ if(!analyser)return 0;
+ analyser.getByteTimeDomainData(timeData);
+ let sum=0;
+ for(let i=0;i<timeData.length;i++){const d=(timeData[i]-128)/128;sum+=d*d;}
+ return Math.min(1,Math.sqrt(sum/timeData.length)*MIC_GAIN);
+}
+// Fake "someone talking" so the demo exercises every state.
+function demoLevel(now){
+ const c=now%DEMO_CYCLE_MS;
+ if(c>DEMO_TALK_MS)return .01;
+ return .22+.22*Math.abs(Math.sin(now*.009))+.09*Math.sin(now*.023);
+}
+function speakEnvelope(now){
+ return Math.max(0,Math.min(1,.38+.34*Math.sin(now*.012)+.2*Math.sin(now*.031)));
+}
+function enter(p,now){phase=p;phaseAt=now;setState(p);}
+
+function tick(){
+ const now=performance.now();
+ const lv=micOn?micLevel():demoLevel(now);
+ if(lv>SPEECH_OFF)quietSince=0; else if(!quietSince)quietSince=now;
+ if(lv>SPEECH_ON){if(!loudSince)loudSince=now;} else loudSince=0;
+
+ if(phase==='speaking'){mic=0;voice=speakEnvelope(now);}
+ else{voice=0;mic=lv;}
+
+ if(phase==='idle'){
+  if(loudSince)enter('listening',now);
+ }else if(phase==='listening'){
+  if(loudSince&&now-loudSince>SUSTAIN_MS)enter('recording',now);
+  else if(quietSince&&now-quietSince>SILENCE_MS)enter('idle',now);
+ }else if(phase==='recording'){
+  if(quietSince&&now-quietSince>SILENCE_MS)enter('thinking',now);
+ }else if(phase==='thinking'){
+  if(now-phaseAt>THINK_MS){enter('speaking',now);
+   caption('J.A.R.V.I.S.',LINES[lineIdx++%LINES.length]);}
+ }else if(phase==='speaking'){
+  if(now-phaseAt>SPEAK_MS)enter('idle',now);
+ }
+}
+
+/* ------------------------- start gate + input ------------------------- */
+const gate=document.getElementById('gate');
+async function engage(){
+ gate.classList.add('gone');
+ try{
+  const stream=await navigator.mediaDevices.getUserMedia({audio:true});
+  const ac=new(window.AudioContext||window.webkitAudioContext)();
+  await ac.resume();
+  analyser=ac.createAnalyser();
+  analyser.fftSize=512; analyser.smoothingTimeConstant=.7;
+  ac.createMediaStreamSource(stream).connect(analyser);
+  timeData=new Uint8Array(analyser.frequencyBinCount);
+  micOn=true;
+ }catch(err){
+  micOn=false;                     // denied, blocked, or no mic: demo cycle
+  mode.textContent='DEMO CYCLE';
+ }
+ enter('idle',performance.now());
+ setInterval(tick,TICK_MS);
+}
+gate.addEventListener('click',engage,{once:true});
+// ?auto=1 skips the gate (kiosk / screenshot). No user gesture means the mic
+// request will be refused, so this always lands in the demo cycle.
+if(new URLSearchParams(location.search).has('auto'))engage();
+
+addEventListener('keydown',e=>{
+ const k=e.key.toLowerCase();
+ if(k==='f'){document.fullscreenElement?document.exitFullscreen()
+  :document.documentElement.requestFullscreen().catch(()=>{});}
+ else if(k==='m'&&analyser){micOn=!micOn;
+  mode.textContent=micOn?MODES[phase]:'DEMO CYCLE';}
+ else if(k==='enter'&&!gate.classList.contains('gone'))engage();
+});
+
+// Hide the pointer once it settles, so a fullscreen tab is all reactor.
+let cursorTimer=0;
+addEventListener('mousemove',()=>{
+ document.body.classList.remove('hidecursor');
+ clearTimeout(cursorTimer);
+ cursorTimer=setTimeout(()=>document.body.classList.add('hidecursor'),2000);
+});
+
+window.__jarvis={setState,setMic:v=>mic=v,setVoice:v=>voice=v,caption,
+ engage,get phase(){return phase},get micOn(){return micOn}};
+window.__dbg={renderer,scene,cam,composer,hue,targetHue,
+ get boot(){return boot},setLevels(m,v){mic=m;voice=v;}};
+</script>
+</body>
+</html>
