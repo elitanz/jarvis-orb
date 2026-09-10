@@ -21,8 +21,22 @@ you say, thinks, and answers out loud in a British voice.
 | "Jarvis, who are you?" | says what it is |
 | anything else | tells you honestly that the thinking half is on the Mac |
 
-The answers are a **local pattern matcher, not an AI**. It has no model behind
-it and doesn't pretend to — the fallback line says so out loud.
+## Giving it a brain
+
+Anything the table above covers is answered **locally** — instant, offline, and
+accurate, because a remote model can't know your real battery level. Everything
+else goes to a real LLM, once you connect one.
+
+Press **K**, paste a [Groq](https://console.groq.com) API key, Save. Then ask it
+anything. It keeps the last few exchanges as context, so follow-ups work
+("what's the capital of Peru?" → "how many people live there?").
+
+The key is stored **only in your browser's localStorage**. It is never in this
+repo, never in the page source, and is sent nowhere except Groq. Press **K** →
+**Forget** to wipe it. Use a dedicated key you can revoke, not a shared one.
+
+With no key connected it stays honest — it tells you it has no brain rather
+than bluffing an answer.
 
 ## The reactor itself
 

@@ -39,6 +39,25 @@
     text-shadow:0 0 22px rgba(255,180,80,.55)}
   #gate small{color:#9e7a3f;font-size:11px;letter-spacing:.2em;line-height:2.1;
     text-transform:uppercase}
+  #keypanel{position:fixed;inset:0;display:none;flex-direction:column;gap:16px;
+    align-items:center;justify-content:center;background:rgba(10,5,1,.86);
+    backdrop-filter:blur(4px);z-index:10;text-align:center;padding:0 6vw}
+  #keypanel.show{display:flex}
+  #keypanel b{color:#ffd9a0;font-size:clamp(14px,1.7vw,19px);font-weight:600;
+    letter-spacing:.38em;text-transform:uppercase;
+    text-shadow:0 0 20px rgba(255,180,80,.5)}
+  #keypanel small{color:#9e7a3f;font-size:10px;letter-spacing:.18em;line-height:2.1;
+    text-transform:uppercase}
+  #keyin{width:min(430px,80vw);background:#1a0f04;border:1px solid #55381a;
+    color:#ffd9a0;padding:11px 14px;font:13px "SF Mono","Menlo",monospace;
+    letter-spacing:.08em;border-radius:4px;outline:0}
+  #keyin:focus{border-color:#ff9a3c;box-shadow:0 0 16px rgba(255,154,60,.25)}
+  #keypanel .row{display:flex;gap:10px}
+  #keypanel button{background:#2a1809;border:1px solid #6b451f;color:#ffb765;
+    padding:9px 20px;font:10px "SF Mono","Menlo",monospace;letter-spacing:.22em;
+    text-transform:uppercase;border-radius:4px;cursor:pointer}
+  #keypanel button:hover{background:#3a2210;border-color:#ff9a3c;color:#ffd9a0}
+  #keystat{min-height:14px;color:#c98a3f}
   #keys{position:fixed;bottom:3vh;right:3vw;color:#6d4e26;font-size:9px;
     letter-spacing:.2em;text-transform:uppercase;line-height:2;text-align:right;
     pointer-events:none;transition:opacity .5s}
@@ -50,13 +69,22 @@
 </head>
 <body>
 <div id="st">BOOT</div>
-<div class="hud" id="tl">J.A.R.V.I.S.<br><span id="up">UPTIME 00:00</span></div>
+<div class="hud" id="tl">J.A.R.V.I.S.<br><span id="up">UPTIME 00:00</span><br>
+  <span id="brain">BRAIN ——</span></div>
 <div class="hud" id="tr"><span id="mode">CORE ONLINE</span><br>
   INPUT<span id="lvl"><i></i></span></div>
 <div class="hud" id="bl">SYS <span id="fps">60</span> FPS<br>
   <span id="pwr">PWR ——</span> · <span id="clk">--:--</span></div>
 <div id="cap"><span class="who"></span><br><span class="txt"></span></div>
-<div id="keys">say &ldquo;jarvis&hellip;&rdquo; to talk<br>F · fullscreen &nbsp; M · mute mic</div>
+<div id="keys">say &ldquo;jarvis&hellip;&rdquo; to talk<br>F · fullscreen &nbsp; M · mute mic &nbsp; K · brain</div>
+<div id="keypanel"><b>Connect a brain</b>
+  <small>Paste a Groq API key. It is stored only in this browser,<br>
+  never in the site, and is sent only to Groq.</small>
+  <input id="keyin" type="password" placeholder="gsk_…" autocomplete="off" spellcheck="false">
+  <div class="row"><button id="keysave">Save</button>
+    <button id="keyclear">Forget</button>
+    <button id="keyclose">Close</button></div>
+  <small id="keystat"></small></div>
 <div id="gate"><b>Tap to engage</b>
   <small>Allow the microphone, then say &ldquo;Jarvis, what time is it?&rdquo;<br>
   Decline and it runs its own demo cycle</small></div>
@@ -427,11 +455,12 @@ if(navigator.getBattery)navigator.getBattery().then(b=>{
  upd();b.addEventListener('levelchange',upd);b.addEventListener('chargingchange',upd);
 }).catch(()=>{});
 
-/* ------------------------------ answers ------------------------------- */
-// Deliberately a local pattern matcher, not an AI. The fallback line says so
-// rather than bluffing — this page has no brain and shouldn't pretend to.
+/* ------------------------------ answers -------------------------------
+   Two tiers. Anything about THIS machine (clock, battery, fullscreen) is
+   answered locally: instant, works offline, and a remote model could never
+   know the real numbers anyway. Everything else goes to the brain.      */
 function twoDigit(n){return String(n).padStart(2,'0');}
-function answer(q){
+function localAnswer(q){
  const t=q.toLowerCase();
  if(/\b(time|clock)\b/.test(t)){const d=new Date();
   return `It is ${d.getHours()%12||12}:${twoDigit(d.getMinutes())} ${d.getHours()<12?'A M':'P M'}.`;}
@@ -452,8 +481,68 @@ function answer(q){
  if(/\b(thank you|thanks|cheers)\b/.test(t))return 'Always a pleasure.';
  if(/(shut ?down|power down|goodbye|good bye)/.test(t))
   return 'Standing down. Say my name when you need me.';
- return 'I only run the reactor on this machine, sir. '
-      + 'The thinking half of me lives on the Mac.';
+ return null;                     // not a local matter — ask the brain
+}
+
+/* ------------------------------- brain -------------------------------- */
+// Groq, called straight from the page (their API sends
+// `access-control-allow-origin: *`, so no proxy is needed). The key is the
+// user's own and lives in localStorage only — never in this file or the repo.
+const KEY_STORE='jarvisGroqKey';
+const GROQ_URL='https://api.groq.com/openai/v1/chat/completions';
+const GROQ_MODEL='qwen/qwen3.8-27b';
+const GROQ_TIMEOUT_MS=15000;
+const GROQ_MAX_TOKENS=160;
+const HISTORY_MAX=8;             // 4 exchanges of context, then forget
+const CAP_CHARS=320;             // captions stay readable; speech says it all
+const SYS='You are JARVIS, the AI assistant. You are speaking aloud, so reply '
+ +'in at most two short sentences of plain prose. Never use markdown, lists, '
+ +'emoji, or symbols. Dry, courteous, British; address the user as "sir" '
+ +'sparingly. If you do not know something, say so plainly.';
+
+let history=[], brainBusy=false;
+const brainEl=document.getElementById('brain');
+function storedKey(){try{return localStorage.getItem(KEY_STORE)||''}catch(_){return''}}
+function showBrain(){brainEl.textContent=storedKey()?'BRAIN GROQ':'BRAIN LOCAL';}
+showBrain();
+
+async function askBrain(q){
+ const key=storedKey();
+ if(!key)return 'I have no brain connected, sir. Press K and paste a Groq key.';
+ const ctl=new AbortController();
+ const timer=setTimeout(()=>ctl.abort(),GROQ_TIMEOUT_MS);
+ try{
+  const res=await fetch(GROQ_URL,{method:'POST',signal:ctl.signal,
+   headers:{'Content-Type':'application/json','Authorization':'Bearer '+key},
+   body:JSON.stringify({model:GROQ_MODEL,max_tokens:GROQ_MAX_TOKENS,
+    temperature:.6,
+    messages:[{role:'system',content:SYS},...history,{role:'user',content:q}]})});
+  if(!res.ok){
+   // Distinguish the failures: a rejected key and a spent quota are not the
+   // same problem, and guessing wrong sends you fixing the wrong thing.
+   if(res.status===401||res.status===403){
+    try{localStorage.removeItem(KEY_STORE)}catch(_){}
+    showBrain();
+    return 'That key was rejected, sir. Press K to enter another.';}
+   if(res.status===429)
+    return 'I am being rate limited, sir. Give it a moment.';
+   return `The link failed, sir. Error ${res.status}.`;
+  }
+  const data=await res.json();
+  const text=((data.choices&&data.choices[0]&&data.choices[0].message.content)||'').trim();
+  if(!text)return 'I have nothing useful to say to that, sir.';
+  history.push({role:'user',content:q},{role:'assistant',content:text});
+  if(history.length>HISTORY_MAX)history=history.slice(-HISTORY_MAX);
+  return text;
+ }catch(e){
+  return e.name==='AbortError'
+   ? 'The link timed out, sir.'
+   : 'I cannot reach the network from here, sir.';
+ }finally{clearTimeout(timer);}
+}
+async function resolveAnswer(q){
+ const local=localAnswer(q);
+ return local!==null?local:await askBrain(q);
 }
 
 /* --------------------------- speech synthesis ------------------------- */
@@ -513,17 +602,24 @@ function finishSpeaking(){
  clearTimeout(speakWatchdog);
  resumeRecog(); awaitingReply=false; enter('idle',performance.now());
 }
+function deliver(text){
+ caption('J.A.R.V.I.S.',text.slice(0,CAP_CHARS));
+ enter('speaking',performance.now());
+ pauseRecog();
+ speak(text,finishSpeaking);
+ // A long answer takes longer to read aloud than the flat 14s floor allows.
+ const budget=Math.max(SPEAK_MAX_MS,text.length*120);
+ speakWatchdog=setTimeout(()=>{if(phase==='speaking')finishSpeaking();},budget);
+}
 function beginReply(now){
  const q=pendingQuery; pendingQuery=null; awaitingReply=true;
  enter('thinking',now);
- setTimeout(()=>{
-  const text=answer(q);
-  caption('J.A.R.V.I.S.',text);
-  enter('speaking',performance.now());
-  pauseRecog();
-  speak(text,finishSpeaking);
-  speakWatchdog=setTimeout(()=>{if(phase==='speaking')finishSpeaking();},SPEAK_MAX_MS);
- },THINK_MS);
+ const started=performance.now();
+ resolveAnswer(q).then(text=>{
+  // Hold the gold "thinking" state for a beat even if the answer was instant.
+  const wait=Math.max(0,THINK_MS-(performance.now()-started));
+  setTimeout(()=>deliver(text),wait);
+ }).catch(()=>deliver('Something went wrong on my end, sir.'));
 }
 
 function tick(){
@@ -583,8 +679,40 @@ gate.addEventListener('click',engage,{once:true});
 // request will be refused, so this always lands in the demo cycle.
 if(new URLSearchParams(location.search).has('auto'))engage();
 
+/* ---------------------------- key panel ------------------------------- */
+const keyPanel=document.getElementById('keypanel'),
+      keyIn=document.getElementById('keyin'),
+      keyStat=document.getElementById('keystat');
+function openKeys(){
+ keyPanel.classList.add('show');
+ keyIn.value=''; keyIn.placeholder=storedKey()?'a key is already saved':'gsk_…';
+ keyStat.textContent=''; keyIn.focus();
+}
+function closeKeys(){keyPanel.classList.remove('show');}
+document.getElementById('keysave').addEventListener('click',()=>{
+ const v=keyIn.value.trim();
+ if(!v){keyStat.textContent='nothing to save';return;}
+ try{localStorage.setItem(KEY_STORE,v);}catch(_){
+  keyStat.textContent='this browser refuses to store it';return;}
+ keyIn.value=''; showBrain();
+ keyStat.textContent='saved — say "jarvis, are you there?"';
+ setTimeout(closeKeys,1400);
+});
+document.getElementById('keyclear').addEventListener('click',()=>{
+ try{localStorage.removeItem(KEY_STORE)}catch(_){}
+ history=[]; showBrain(); keyStat.textContent='forgotten';
+});
+document.getElementById('keyclose').addEventListener('click',closeKeys);
+keyIn.addEventListener('keydown',e=>{
+ e.stopPropagation();                       // don't trigger F/M/K while typing
+ if(e.key==='Enter')document.getElementById('keysave').click();
+ if(e.key==='Escape')closeKeys();
+});
+
 addEventListener('keydown',e=>{
  const k=e.key.toLowerCase();
+ if(k==='k'){keyPanel.classList.contains('show')?closeKeys():openKeys();return;}
+ if(keyPanel.classList.contains('show'))return;
  if(k==='f'){document.fullscreenElement?document.exitFullscreen()
   :document.documentElement.requestFullscreen().catch(()=>{});}
  else if(k==='m'&&analyser){micOn=!micOn;
@@ -602,9 +730,9 @@ addEventListener('mousemove',()=>{
 });
 
 window.__jarvis={setState,setMic:v=>mic=v,setVoice:v=>voice=v,caption,
- engage,answer,heard,speak,
+ engage,localAnswer,resolveAnswer,askBrain,heard,speak,openKeys,
  get phase(){return phase},get micOn(){return micOn},
- get recogAllowed(){return recogAllowed}};
+ get recogAllowed(){return recogAllowed},get hasKey(){return!!storedKey()}};
 window.__dbg={renderer,scene,cam,composer,hue,targetHue,
  get boot(){return boot},setLevels(m,v){mic=m;voice=v;}};
 </script>
