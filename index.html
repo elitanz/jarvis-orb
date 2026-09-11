@@ -58,6 +58,31 @@
     text-transform:uppercase;border-radius:4px;cursor:pointer}
   #keypanel button:hover{background:#3a2210;border-color:#ff9a3c;color:#ffd9a0}
   #keystat{min-height:14px;color:#c98a3f}
+  #diag{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);
+    display:none;flex-direction:column;gap:6px;z-index:11;
+    background:rgba(12,6,1,.94);border:1px solid #55381a;border-radius:6px;
+    padding:20px 24px;min-width:min(440px,86vw);
+    font:11px "SF Mono","Menlo",monospace;color:#c99a5a;letter-spacing:.06em}
+  #diag.show{display:flex}
+  #diag h4{margin:0 0 6px;color:#ffd9a0;font-size:11px;letter-spacing:.34em;
+    text-transform:uppercase;font-weight:600}
+  #diag .r{display:flex;justify-content:space-between;gap:18px}
+  #diag .r b{font-weight:400;color:#8f6a41}
+  #diag .ok{color:#7fd18b}  #diag .bad{color:#ff7a5c}
+  #diag .row{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
+  #diag button{background:#2a1809;border:1px solid #6b451f;color:#ffb765;
+    padding:7px 13px;font:9px "SF Mono","Menlo",monospace;letter-spacing:.18em;
+    text-transform:uppercase;border-radius:4px;cursor:pointer}
+  #diag button:hover{background:#3a2210;border-color:#ff9a3c}
+  #diagout{margin-top:8px;color:#ffd9a0;max-width:60ch;line-height:1.7;
+    word-break:break-word}
+  #typebar{position:fixed;left:50%;bottom:14vh;transform:translateX(-50%);
+    display:none;width:min(560px,84vw);z-index:8}
+  #typebar.show{display:block}
+  #typein{width:100%;background:rgba(26,15,4,.95);border:1px solid #6b451f;
+    color:#ffd9a0;padding:12px 16px;font:14px "SF Mono","Menlo",monospace;
+    border-radius:5px;outline:0;box-sizing:border-box}
+  #typein:focus{border-color:#ff9a3c;box-shadow:0 0 20px rgba(255,154,60,.3)}
   #keys{position:fixed;bottom:3vh;right:3vw;color:#6d4e26;font-size:9px;
     letter-spacing:.2em;text-transform:uppercase;line-height:2;text-align:right;
     pointer-events:none;transition:opacity .5s}
@@ -76,7 +101,23 @@
 <div class="hud" id="bl">SYS <span id="fps">60</span> FPS<br>
   <span id="pwr">PWR ——</span> · <span id="clk">--:--</span></div>
 <div id="cap"><span class="who"></span><br><span class="txt"></span></div>
-<div id="keys">say &ldquo;jarvis&hellip;&rdquo; to talk<br>F · fullscreen &nbsp; M · mute mic &nbsp; K · brain</div>
+<div id="keys">say &ldquo;jarvis&hellip;&rdquo; &nbsp;or&nbsp; <b>T</b> to type<br>
+  F · fullscreen &nbsp; M · mute &nbsp; K · brain &nbsp; D · doctor</div>
+<div id="typebar"><input id="typein" type="text"
+  placeholder="Type to JARVIS, then Enter  (no mic needed)" autocomplete="off"></div>
+<div id="diag"><h4>Doctor</h4>
+  <div class="r"><b>secure page (https)</b><span id="d_https">—</span></div>
+  <div class="r"><b>speech recognition API</b><span id="d_sr">—</span></div>
+  <div class="r"><b>microphone permission</b><span id="d_perm">—</span></div>
+  <div class="r"><b>recognition running</b><span id="d_run">—</span></div>
+  <div class="r"><b>last recognition error</b><span id="d_err">—</span></div>
+  <div class="r"><b>heard anything yet</b><span id="d_heard">—</span></div>
+  <div class="r"><b>speech synthesis voices</b><span id="d_tts">—</span></div>
+  <div class="r"><b>brain key saved</b><span id="d_key">—</span></div>
+  <div class="row"><button id="d_testbrain">Test brain</button>
+    <button id="d_testvoice">Test voice</button>
+    <button id="d_close">Close</button></div>
+  <div id="diagout"></div></div>
 <div id="keypanel"><b>Connect a brain</b>
   <small>Paste a Groq API key. It is stored only in this browser,<br>
   never in the site, and is sent only to Groq.</small>
@@ -395,9 +436,14 @@ const st=document.getElementById('st'),cap=document.getElementById('cap'),
       mode=document.getElementById('mode');
 const MODES={idle:'CORE ONLINE',listening:'AUDIO INTAKE',recording:'CAPTURING',
              thinking:'PROCESSING',speaking:'RESPONDING'};
+// A fault outranks the state label: if something is blocked, the HUD has to
+// say so. Silently idling is what made a blocked mic look like a dead page.
+let fault='';
+function refreshMode(){mode.textContent=fault||MODES[state]||state.toUpperCase();}
+function setFault(f){fault=f;refreshMode();}
 function setState(s){state=s;targetHue.set(COLORS[s]??COLORS.idle);
  st.textContent=s.toUpperCase();st.style.color='#'+targetHue.getHexString();
- mode.textContent=MODES[s]??s.toUpperCase();}
+ refreshMode();}
 function caption(who,txt){cap.querySelector('.who').textContent=who;
  cap.querySelector('.txt').textContent=txt;cap.style.opacity=1;
  clearTimeout(cap._t);cap._t=setTimeout(()=>cap.style.opacity=0,9000);}
@@ -577,37 +623,66 @@ function speak(text,onDone){
 
 /* -------------------------- speech recognition ------------------------ */
 const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
-let recog=null, recogAllowed=false, recogWanted=false;
+const RECOG_RETRY_MS=800, RECOG_NET_BACKOFF_MS=5000;
+let recog=null, recogAllowed=false, recogWanted=false, recogRunning=false;
+let recogError='', heardAnything=false, retryTimer=0;
+
 function heard(text){
+ heardAnything=true;
  caption('You',text.slice(-160));
  if(WAKE.test(text))pendingQuery=text.replace(WAKE,' ').trim();
 }
+// start() throws InvalidStateError if the previous session is still closing.
+// Swallowing that was killing recognition permanently after the first reply.
+function safeStart(){
+ if(!recog||!recogAllowed||!recogWanted||recogRunning)return;
+ try{recog.start();}
+ catch(_){clearTimeout(retryTimer);retryTimer=setTimeout(safeStart,RECOG_RETRY_MS);}
+}
+function scheduleRestart(){
+ if(!recogWanted||!recogAllowed)return;
+ clearTimeout(retryTimer);
+ // Back off on a network fault rather than hammering a blocked endpoint.
+ retryTimer=setTimeout(safeStart,
+  recogError==='network'?RECOG_NET_BACKOFF_MS:RECOG_RETRY_MS);
+}
 function startRecog(){
- if(!SR)return;
+ if(!SR){recogError='no-speech-api';setFault('NO SPEECH API');return;}
  recog=new SR();
  recog.continuous=true; recog.interimResults=true; recog.lang='en-US';
+ recog.onstart=()=>{recogRunning=true;setFault('');};
  recog.onresult=e=>{
   let fin='',interim='';
   for(let i=e.resultIndex;i<e.results.length;i++){
    const r=e.results[i];
    if(r.isFinal)fin+=r[0].transcript; else interim+=r[0].transcript;
   }
-  if(interim.trim())caption('You',interim.trim().slice(-160));
+  if(interim.trim()){heardAnything=true;caption('You',interim.trim().slice(-160));}
   if(fin.trim())heard(fin.trim());
  };
- // Chrome ends the session on its own schedule; restart unless we paused it.
- recog.onend=()=>{if(recogWanted&&recogAllowed)try{recog.start()}catch(_){}};
+ recog.onend=()=>{recogRunning=false;scheduleRestart();};
  recog.onerror=ev=>{
-  if(ev.error==='not-allowed'||ev.error==='service-not-allowed')recogAllowed=false;
+  recogError=ev.error||'unknown';
+  // 'no-speech' and 'aborted' are routine; the rest are worth showing.
+  if(ev.error==='not-allowed'||ev.error==='service-not-allowed'){
+   recogAllowed=false;recogWanted=false;setFault('MIC BLOCKED · PRESS T');
+  }else if(ev.error==='network'){
+   setFault('SPEECH NET BLOCKED · PRESS T');
+  }else if(ev.error==='audio-capture'){
+   setFault('NO MICROPHONE · PRESS T');
+  }
  };
  recogAllowed=true; recogWanted=true;
- try{recog.start()}catch(_){recogAllowed=false;}
+ safeStart();
 }
 // Muted while JARVIS talks, or it transcribes its own voice back to itself.
-function pauseRecog(){recogWanted=false;if(recog)try{recog.stop()}catch(_){}}
+function pauseRecog(){
+ recogWanted=false; clearTimeout(retryTimer);
+ if(recog&&recogRunning)try{recog.stop()}catch(_){}
+}
 function resumeRecog(){
  if(!recog||!recogAllowed)return;
- recogWanted=true; try{recog.start()}catch(_){}
+ recogWanted=true; safeStart();
 }
 
 function finishSpeaking(){
@@ -667,6 +742,15 @@ function tick(){
 
 /* ------------------------- start gate + input ------------------------- */
 const gate=document.getElementById('gate');
+// The tick loop must be able to start without a working mic, so a typed
+// question still works on a device where audio input is blocked outright.
+let loopStarted=false;
+function ensureLoop(){
+ if(loopStarted)return;
+ loopStarted=true;
+ enter('idle',performance.now());
+ setInterval(tick,TICK_MS);
+}
 async function engage(){
  gate.classList.add('gone');
  try{
@@ -681,10 +765,9 @@ async function engage(){
   startRecog();                    // words, on top of the volume animation
  }catch(err){
   micOn=false;                     // denied, blocked, or no mic: demo cycle
-  mode.textContent='DEMO CYCLE';
+  setFault('MIC BLOCKED · PRESS T');
  }
- enter('idle',performance.now());
- setInterval(tick,TICK_MS);
+ ensureLoop();
 }
 gate.addEventListener('click',engage,{once:true});
 // ?auto=1 skips the gate (kiosk / screenshot). No user gesture means the mic
@@ -721,15 +804,74 @@ keyIn.addEventListener('keydown',e=>{
  if(e.key==='Escape')closeKeys();
 });
 
+/* ------------------------- typed input (no mic) ----------------------- */
+const typeBar=document.getElementById('typebar'),
+      typeIn=document.getElementById('typein');
+function openType(){
+ gate.classList.add('gone'); ensureLoop();
+ typeBar.classList.add('show'); typeIn.focus();
+}
+function closeType(){typeBar.classList.remove('show');typeIn.blur();}
+function submitTyped(){
+ const v=typeIn.value.trim(); if(!v)return;
+ typeIn.value='';
+ caption('You',v.slice(-160));
+ pendingQuery=v;                  // typed questions skip the wake word
+}
+typeIn.addEventListener('keydown',e=>{
+ e.stopPropagation();
+ if(e.key==='Enter')submitTyped();
+ else if(e.key==='Escape')closeType();
+});
+
+/* ------------------------------ doctor -------------------------------- */
+const diag=document.getElementById('diag'),
+      dOut=document.getElementById('diagout');
+function mark(id,ok,txt){
+ const el=document.getElementById(id);
+ el.textContent=txt; el.className=ok?'ok':'bad';
+}
+async function refreshDiag(){
+ mark('d_https',isSecureContext,isSecureContext?'yes':'NO — mic needs https');
+ mark('d_sr',!!SR,SR?'available':'MISSING');
+ let perm='unknown';
+ try{perm=(await navigator.permissions.query({name:'microphone'})).state;}catch(_){}
+ mark('d_perm',perm==='granted',perm);
+ mark('d_run',recogRunning,recogRunning?'yes':'no');
+ mark('d_err',!recogError,recogError||'none');
+ mark('d_heard',heardAnything,heardAnything?'yes':'no');
+ const nv=('speechSynthesis' in window)?speechSynthesis.getVoices().length:0;
+ mark('d_tts',nv>0,String(nv));
+ mark('d_key',!!storedKey(),storedKey()?'yes':'no');
+}
+function openDiag(){diag.classList.add('show');dOut.textContent='';refreshDiag();}
+function closeDiag(){diag.classList.remove('show');}
+document.getElementById('d_close').addEventListener('click',closeDiag);
+document.getElementById('d_testvoice').addEventListener('click',()=>{
+ dOut.textContent='speaking…';
+ speak('Voice test. If you can hear this, audio output is working.',
+  ()=>{dOut.textContent='voice finished — did you actually hear it?';});
+});
+document.getElementById('d_testbrain').addEventListener('click',async()=>{
+ dOut.textContent='calling Groq…';
+ const t0=Date.now();
+ const r=await askBrain('Reply with exactly: brain online');
+ dOut.textContent=(Date.now()-t0)+'ms — '+r;
+ refreshDiag();
+});
+
 addEventListener('keydown',e=>{
  const k=e.key.toLowerCase();
  if(k==='k'){keyPanel.classList.contains('show')?closeKeys():openKeys();return;}
  if(keyPanel.classList.contains('show'))return;
+ if(k==='d'){diag.classList.contains('show')?closeDiag():openDiag();return;}
+ if(diag.classList.contains('show'))return;
+ if(k==='t'){typeBar.classList.contains('show')?closeType():openType();return;}
  if(k==='f'){document.fullscreenElement?document.exitFullscreen()
   :document.documentElement.requestFullscreen().catch(()=>{});}
  else if(k==='m'&&analyser){micOn=!micOn;
   micOn?resumeRecog():pauseRecog();
-  mode.textContent=micOn?MODES[phase]:'DEMO CYCLE';}
+  setFault(micOn?'':'MUTED');}
  else if(k==='enter'&&!gate.classList.contains('gone'))engage();
 });
 
@@ -743,6 +885,8 @@ addEventListener('mousemove',()=>{
 
 window.__jarvis={setState,setMic:v=>mic=v,setVoice:v=>voice=v,caption,
  engage,localAnswer,resolveAnswer,askBrain,heard,speak,openKeys,
+ openDiag,refreshDiag,openType,submitTyped,
+ get fault(){return fault},get recogError(){return recogError},
  get phase(){return phase},get micOn(){return micOn},
  get recogAllowed(){return recogAllowed},get hasKey(){return!!storedKey()}};
 window.__dbg={renderer,scene,cam,composer,hue,targetHue,
